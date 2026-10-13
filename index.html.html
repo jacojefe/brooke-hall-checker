@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#173b32">
+<title>Brooke Hall Resident Checker</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17211e;background:#f3f6f4}
+*{box-sizing:border-box}
+body{margin:0}
+header{background:#173b32;color:#fff;padding:22px 18px 20px}
+header h1{font-size:22px;margin:0 0 5px}
+header p{margin:0;color:#d7e7df;font-size:14px}
+main{max-width:680px;margin:0 auto;padding:16px;display:grid;gap:14px}
+.card{background:white;border:1px solid #dce5df;border-radius:16px;padding:16px;box-shadow:0 2px 8px #142c2010}
+h2{font-size:17px;margin:0 0 10px}
+p{line-height:1.45}
+.small{font-size:13px;color:#56665e}
+button,.file-label{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:11px;padding:12px 14px;font-size:15px;font-weight:650;cursor:pointer;min-height:44px}
+.primary{background:#173b32;color:white}
+.secondary{background:#e7eee9;color:#173b32}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type=file]{max-width:100%;font-size:14px}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+video{width:100%;max-height:48vh;background:#17211e;border-radius:12px;display:block;object-fit:cover}
+#cameraPlaceholder{border-radius:12px;background:#edf2ee;padding:35px 14px;text-align:center;color:#526259}
+#result{border-radius:13px;padding:18px;text-align:center;background:#edf2ee}
+#result .status{font-size:27px;font-weight:800;letter-spacing:.2px}
+#result .detail{margin-top:7px;font-size:15px;overflow-wrap:anywhere}
+#result.found{background:#e0f4e7;color:#14552d}
+#result.notfound{background:#fde8e7;color:#8e201d}
+#result.waiting{color:#526259}
+#result .status{display:block}
+#ocrText{font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;color:#536159;margin-top:8px}
+progress{width:100%;height:8px}
+footer{font-size:12px;color:#66756d;padding:0 3px 20px}
+.hidden{display:none!important}
+.notice{background:#fff7df;border:1px solid #efdda3;padding:10px 12px;border-radius:10px;font-size:13px;color:#614d13}
+</style>
+</head>
+<body>
+<header>
+  <h1>Brooke Hall Resident Checker</h1>
+  <p>Scan a printed name and check it against your current guest list.</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. Load current guest list</h2>
+    <p class="small">Choose a CSV file with a column headed <b>Name</b> or <b>Full Name</b>. An optional <b>Room</b> column will be shown when a match is found. The file is processed in this browser.</p>
+    <input id="csvFile" type="file" accept=".csv,text/csv">
+    <p id="listStatus" class="small">No list loaded yet.</p>
+    <button id="clearList" class="secondary" type="button">Clear guest list</button>
+  </section>
+
+  <section class="card">
+    <h2>2. Point camera at the printed name</h2>
+    <p class="small">Keep the name clear, well lit and filling the camera view. Tap Scan when ready.</p>
+    <div id="cameraPlaceholder">Camera is off. Tap “Start camera” to begin.</div>
+    <video id="video" class="hidden" autoplay playsinline muted></video>
+    <canvas id="canvas" class="hidden"></canvas>
+    <div class="row" style="margin-top:12px">
+      <button id="startCamera" class="primary" type="button">Start camera</button>
+      <button id="scan" class="primary" type="button" disabled>Scan name</button>
+      <button id="stopCamera" class="secondary" type="button" disabled>Stop camera</button>
+    </div>
+    <p id="scanStatus" class="small" aria-live="polite">Ready when you are.</p>
+    <progress id="progress" class="hidden" max="100" value="0"></progress>
+  </section>
+
+  <section class="card">
+    <h2>Result</h2>
+    <div id="result" class="waiting" aria-live="polite">
+      <span class="status">READY</span>
+      <div class="detail">Load your current guest list, then scan a printed name.</div>
+    </div>
+    <div id="ocrWrap" class="hidden">
+      <p class="small"><b>Text read from the document</b></p>
+      <div id="ocrText"></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="resetResult" class="secondary" type="button">Reset result</button>
+    </div>
+  </section>
+  <div class="notice">Privacy: this page checks names locally in your browser. The OCR engine is downloaded from a public CDN when needed. Only use resident data on a device and account approved by your organisation.</div>
+  <footer>For operational checking only. If a name is read incorrectly or a result is uncertain, verify it manually against your approved records.</footer>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let guests = [];
+  let stream = null;
+  let worker = null;
+  let busy = false;
+
+  function normalize(s) {
+    return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+  }
+  function showResult(kind, status, detail) {
+    const box = $("result");
+    box.className = kind;
+    box.innerHTML = "";
+    const s = document.createElement("span");
+    s.className = "status"; s.textContent = status;
+    const d = document.createElement("div");
+    d.className = "detail"; d.textContent = detail;
+    box.append(s, d);
+  }
+  function setScanStatus(msg) { $("scanStatus").textContent = msg; }
+  function updateListStatus() {
+    $("listStatus").textContent = guests.length
+      ? `${guests.length} current guest${guests.length === 1 ? "" : "s"} loaded.`
+      : "No list loaded yet.";
+    $("scan").disabled = !guests.length || !stream || busy;
+  }
+
+  $("csvFile").addEventListener("change", async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = Papa.parse(text, {header:true, skipEmptyLines:true});
+      if (parsed.errors.length && !parsed.data.length) throw new Error("Could not read the CSV.");
+      const fields = parsed.meta.fields || [];
+      const nameField = fields.find(f => ["name","fullname","guestname","residentname"].includes(normalize(f).replace(/\s/g,"")));
+      const roomField = fields.find(f => ["room","roomnumber","roomno"].includes(normalize(f).replace(/\s/g,"")));
+      if (!nameField) throw new Error("Could not find a Name or Full Name column. Please check the CSV headings.");
+      guests = parsed.data.map(r => ({
+        name: String(r[nameField] || "").trim(),
+        room: roomField ? String(r[roomField] || "").trim() : ""
+      })).filter(g => g.name);
+      $("listStatus").textContent = `${guests.length} current guest${guests.length===1?"":"s"} loaded from ${file.name}.`;
+      showResult("waiting","LIST LOADED","Scan a printed name to check whether it appears on the current guest list.");
+      updateListStatus();
+    } catch(err) {
+      guests = []; updateListStatus();
+      $("listStatus").textContent = err.message || "Could not read file.";
+    }
+  });
+
+  $("clearList").addEventListener("click", () => {
+    guests = []; $("csvFile").value = ""; updateListStatus();
+    showResult("waiting","READY","Load your current guest list, then scan a printed name.");
+  });
+
+  $("startCamera").addEventListener("click", async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setScanStatus("Camera access requires the page to be opened from a secure HTTPS website.");
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio:false, video:{facingMode:{ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080}}
+      });
+      $("video").srcObject = stream;
+      $("video").classList.remove("hidden");
+      $("cameraPlaceholder").classList.add("hidden");
+      $("startCamera").disabled = true;
+      $("stopCamera").disabled = false;
+      updateListStatus();
+      setScanStatus("Camera on. Frame the printed name, then tap Scan name.");
+    } catch(err) {
+      setScanStatus("Could not open camera. Allow camera access in Safari settings and try again.");
+    }
+  });
+
+  $("stopCamera").addEventListener("click", stopCamera);
+  function stopCamera() {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; $("video").srcObject = null;
+    $("video").classList.add("hidden"); $("cameraPlaceholder").classList.remove("hidden");
+    $("startCamera").disabled = false; $("stopCamera").disabled = true;
+    updateListStatus(); setScanStatus("Camera is off.");
+  }
+
+  function findGuest(text) {
+    const nText = normalize(text);
+    if (!nText) return null;
+    // Prefer a full-name phrase in the OCR text. Avoid matching on first names alone.
+    const matches = guests.filter(g => {
+      const name = normalize(g.name);
+      if (name.length < 4) return false;
+      return (` ${nText} `).includes(` ${name} `);
+    });
+    if (matches.length === 1) return matches[0];
+    // OCR can split lines or punctuation; accept a name if all its tokens are present
+    // and the complete name has at least two tokens.
+    const tokens = new Set(nText.split(" "));
+    const soft = guests.filter(g => {
+      const parts = normalize(g.name).split(" ").filter(Boolean);
+      return parts.length >= 2 && parts.every(p => tokens.has(p));
+    });
+    return soft.length === 1 ? soft[0] : null;
+  }
+
+  $("scan").addEventListener("click", async () => {
+    if (!stream || !guests.length || busy) return;
+    const video = $("video");
+    if (!video.videoWidth) { setScanStatus("Camera is still starting. Try again in a moment."); return; }
+    busy = true; $("scan").disabled = true; $("progress").classList.remove("hidden"); $("progress").value = 0;
+    setScanStatus("Reading text…");
+    try {
+      const canvas = $("canvas");
+      const maxWidth = 1600;
+      const scale = Math.min(1, maxWidth / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (!worker) {
+        worker = await Tesseract.createWorker("eng", 1, {
+          logger: m => { if (m.status === "recognizing text") $("progress").value = Math.round((m.progress || 0)*100); }
+        });
+      }
+      const result = await worker.recognize(canvas);
+      const text = result.data.text || "";
+      $("ocrText").textContent = text || "(No text detected)";
+      $("ocrWrap").classList.remove("hidden");
+      const guest = findGuest(text);
+      if (guest) {
+        const room = guest.room ? `Room ${guest.room}` : "Current guest list match";
+        showResult("found","FOUND",`${guest.name}${guest.room ? " — Room " + guest.room : ""}`);
+        setScanStatus("Match found on the current guest list.");
+      } else {
+        showResult("notfound","NOT FOUND","No matching name found on the current guest list.");
+        setScanStatus("No match found. Check that the name is clear and try scanning again.");
+      }
+    } catch(err) {
+      showResult("waiting","SCAN ERROR","Could not read the document. Try better lighting and hold the phone steady.");
+      setScanStatus("Scanning failed. Please try again.");
+    } finally {
+      busy = false; $("progress").classList.add("hidden"); updateListStatus();
+    }
+  });
+
+  $("resetResult").addEventListener("click", () => {
+    $("ocrWrap").classList.add("hidden"); $("ocrText").textContent = "";
+    showResult("waiting","READY","Frame a printed name and tap Scan name.");
+    setScanStatus("Ready.");
+  });
+  window.addEventListener("pagehide", () => {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (worker) worker.terminate();
+  });
+})();
+</script>
+</body>
+</html>
