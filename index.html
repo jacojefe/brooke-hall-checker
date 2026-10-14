@@ -271,13 +271,21 @@ footer{font-size:12px;color:#66756d;padding:0 3px 20px}
         px[i] = px[i+1] = px[i+2] = contrast;
       }
       ctx.putImageData(imageData, 0, 0);
-      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT });
+      // Keep normal page layout analysis for the enhanced pass too. Sparse-text
+      // mode often returns one character per line on camera images and can be noisy.
+      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
       const enhanced = await worker.recognize(canvas);
       const enhancedText = enhanced.data.text || "";
       const enhancedGuest = findGuest(enhancedText);
-      if (enhancedGuest || enhancedText.length > bestText.length) bestText = enhancedText;
-      if (enhancedGuest) guest = enhancedGuest;
-      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
+
+      // Prefer a guest match from either pass. If neither matches, show the first
+      // pass because the contrast pass can produce more OCR noise.
+      if (enhancedGuest && !guest) {
+        guest = enhancedGuest;
+        bestText = enhancedText;
+      } else if (!guest && !enhancedGuest && enhancedText.length > bestText.length * 1.15) {
+        bestText = enhancedText;
+      }
 
       $("ocrText").textContent = bestText || "(No text detected)";
       $("ocrWrap").classList.remove("hidden");
