@@ -244,22 +244,43 @@ footer{font-size:12px;color:#66756d;padding:0 3px 20px}
     setScanStatus("Reading text…");
     try {
       const canvas = $("canvas");
-      const maxWidth = 1600;
-      const scale = Math.min(1, maxWidth / video.videoWidth);
+      // Upscale the camera frame and create a high-contrast grayscale copy to help
+      // OCR read small printed text. This can help with letters, though monitor moire
+      // and motion blur may still reduce accuracy.
+      const maxWidth = 2200;
+      const scale = Math.min(2, maxWidth / video.videoWidth);
       canvas.width = Math.round(video.videoWidth * scale);
       canvas.height = Math.round(video.videoHeight * scale);
-      const ctx = canvas.getContext("2d");
+      const ctx = canvas.getContext("2d", {willReadFrequently:true});
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       if (!worker) {
         worker = await Tesseract.createWorker("eng", 1, {
           logger: m => { if (m.status === "recognizing text") $("progress").value = Math.round((m.progress || 0)*100); }
         });
       }
-      const result = await worker.recognize(canvas);
-      const text = result.data.text || "";
-      $("ocrText").textContent = text || "(No text detected)";
+      const original = await worker.recognize(canvas);
+      let bestText = original.data.text || "";
+      let guest = findGuest(bestText);
+
+      // Second OCR pass: grayscale + stronger contrast, useful for smaller type.
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const px = imageData.data;
+      for (let i = 0; i < px.length; i += 4) {
+        const gray = 0.299 * px[i] + 0.587 * px[i+1] + 0.114 * px[i+2];
+        const contrast = Math.max(0, Math.min(255, (gray - 128) * 1.45 + 128));
+        px[i] = px[i+1] = px[i+2] = contrast;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT });
+      const enhanced = await worker.recognize(canvas);
+      const enhancedText = enhanced.data.text || "";
+      const enhancedGuest = findGuest(enhancedText);
+      if (enhancedGuest || enhancedText.length > bestText.length) bestText = enhancedText;
+      if (enhancedGuest) guest = enhancedGuest;
+      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
+
+      $("ocrText").textContent = bestText || "(No text detected)";
       $("ocrWrap").classList.remove("hidden");
-      const guest = findGuest(text);
       if (guest) {
         const room = guest.room ? `Room ${guest.room}` : "Current guest list match";
         showResult("found","FOUND",`${guest.name}${guest.room ? " — Room " + guest.room : ""}`);
