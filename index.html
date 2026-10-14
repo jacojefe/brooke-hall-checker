@@ -179,21 +179,61 @@ footer{font-size:12px;color:#66756d;padding:0 3px 20px}
   function findGuest(text) {
     const nText = normalize(text);
     if (!nText) return null;
-    // Prefer a full-name phrase in the OCR text. Avoid matching on first names alone.
-    const matches = guests.filter(g => {
+    const tokenSet = new Set(nText.split(" ").filter(Boolean));
+
+    // A room number can resolve duplicate names if the document includes it.
+    let scannedRoom = "";
+    const roomMatch = (text || "").match(/\broom\s*(?:no\.?|number)?\s*[:#-]?\s*([a-z]?\d+[a-z]?)\b/i);
+    if (roomMatch) scannedRoom = normalize(roomMatch[1]);
+
+    // Prefer full names found as a phrase in the recognised document text.
+    let matches = guests.filter(g => {
       const name = normalize(g.name);
-      if (name.length < 4) return false;
-      return (` ${nText} `).includes(` ${name} `);
+      return name.length >= 4 && (` ${nText} `).includes(` ${name} `);
     });
+
+    // Also support common abbreviated letter formats such as "Ms M Sun" / "Mr J Smith".
+    // The first initial and surname must both match a name in the CSV.
+    if (!matches.length) {
+      const lines = (text || "").split(/\r?\n/).map(line =>
+        normalize(line).replace(/^(mr|mrs|ms|miss|mx|dr)\s+/, "").trim()
+      );
+      const abbreviated = [];
+      for (const line of lines) {
+        const parts = line.split(" ").filter(Boolean);
+        if (parts.length < 2) continue;
+        const first = parts[0];
+        const surname = parts[parts.length - 1];
+        if (first.length !== 1 || surname.length < 2) continue;
+        for (const g of guests) {
+          const nameParts = normalize(g.name).split(" ").filter(Boolean);
+          if (nameParts.length >= 2 && nameParts[0][0] === first && nameParts[nameParts.length - 1] === surname) {
+            abbreviated.push(g);
+          }
+        }
+      }
+      matches = abbreviated;
+    }
+
+    // Allow a complete name to be split across lines, but never match a first name alone.
+    if (!matches.length) {
+      matches = guests.filter(g => {
+        const parts = normalize(g.name).split(" ").filter(Boolean);
+        return parts.length >= 2 && parts.every(p => tokenSet.has(p));
+      });
+    }
+
+    // Ignore duplicate rows in the uploaded file.
+    matches = [...new Map(matches.map(g => [normalize(g.name) + "|" + normalize(g.room), g])).values()];
     if (matches.length === 1) return matches[0];
-    // OCR can split lines or punctuation; accept a name if all its tokens are present
-    // and the complete name has at least two tokens.
-    const tokens = new Set(nText.split(" "));
-    const soft = guests.filter(g => {
-      const parts = normalize(g.name).split(" ").filter(Boolean);
-      return parts.length >= 2 && parts.every(p => tokens.has(p));
-    });
-    return soft.length === 1 ? soft[0] : null;
+
+    // Same-name residents are only resolved when a room number on the document
+    // identifies exactly one CSV entry. Otherwise fail safely rather than guess.
+    if (matches.length > 1 && scannedRoom) {
+      const roomMatches = matches.filter(g => normalize(g.room) === scannedRoom);
+      if (roomMatches.length === 1) return roomMatches[0];
+    }
+    return null;
   }
 
   $("scan").addEventListener("click", async () => {
